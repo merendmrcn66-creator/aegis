@@ -46,5 +46,3 @@ python aegis.py
 ## License
 
 This is a personal/experimental agent project. Check with the repository owner for usage terms.
-
->Note: This version is the first version of the project this situation might ended up with some problems 

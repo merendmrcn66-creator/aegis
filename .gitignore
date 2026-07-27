@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Database
+aegis_auth.db
+*.db
+*.sqlite
+
+# Virtual Environment
+venv/
+.venv/
+env/
+ENV/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Config / Credentials
+.env
+session.json
+config.json
+history.json
+usage.json

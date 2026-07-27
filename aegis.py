@@ -58,6 +58,17 @@ import subprocess
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
+import ctypes
+import keyring
+import requests
+import webbrowser
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.parse
+try:
+    from gtts import gTTS
+    GTTS_AVAILABLE = True
+except ImportError:
+    GTTS_AVAILABLE = False
 
 # Klavye dinleme (Enter: iptal, E: düzenle) için platforma özgü modüller
 IS_WINDOWS = sys.platform.startswith("win")
@@ -988,7 +999,7 @@ def detect_browser_profiles(channel):
 
 
 class BrowserController:
-    """Tek bir kalıcı tarayıcı oturumunu yönetir (lazy-init, tekil)."""
+    """Tek bir kalıcı tarayıcı oturumunu yönetir (lazy-init, tekil, thread-safe)."""
 
     LIVE_WINDOW_NAME = "Tarayici (canli izleme) - turuncu imlec = yapay zekanin dokunusu"
     MAX_FPS = 60
@@ -1010,31 +1021,179 @@ class BrowserController:
         self._live_stop = threading.Event()
         self._frame_callback = None  # GUI tarafından atanır: fn(frame_bgr_ndarray) -> None
 
+        # Thread-safety queue and worker thread
+        self._queue = queue.Queue()
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._lock = threading.Lock()
+
     def set_frame_callback(self, fn):
         """GUI'nin her yeni kareyi (sanal imleç zaten çizilmiş, BGR ndarray) almak için
         kaydettiği fonksiyon. Ayarlandığında ayrı bir cv2 penceresi açılmaz — kareler
         sadece bu callback'e gönderilir (sohbet balonu içindeki gömülü görünüm için)."""
         self._frame_callback = fn
 
-    def user_click(self, x, y):
-        """Kullanıcının gömülü tarayıcı görünümüne tıklamasıyla tetiklenir; yapay zekanın
-        sanal imlecinden bağımsız olarak sayfada gerçek bir fare tıklaması yapar."""
-        if not self.page:
-            return
-        try:
-            self.page.mouse.click(x, y)
-        except Exception:
-            pass
+    def _start_thread(self):
+        with self._lock:
+            if not self._thread or not self._thread.is_alive():
+                self._stop_event.clear()
+                self._queue = queue.Queue()
+                self._thread = threading.Thread(target=self._browser_thread_worker, daemon=True)
+                self._thread.start()
 
-    def user_type(self, text):
-        """Kullanıcının gömülü tarayıcı yazma kutusundan girdiği metni, o an odaklı
-        elemana yazar (Enter dahil değildir, çağıran taraf isterse ayrıca gönderir)."""
-        if not self.page:
-            return
+    def _send_action(self, action_name, **kwargs):
+        if action_name == "ensure_started":
+            self._start_thread()
+            
+        with self._lock:
+            if not self._thread or not self._thread.is_alive():
+                if action_name == "close":
+                    return True
+                return {"error": "Tarayıcı çalışmıyor."}
+                
+        resp_q = queue.Queue()
+        self._queue.put({"action": action_name, "kwargs": kwargs, "resp_q": resp_q})
         try:
+            res = resp_q.get(timeout=35) # Wait with a timeout
+            if isinstance(res, Exception):
+                return {"error": str(res)}
+            return res
+        except queue.Empty:
+            return {"error": "Tarayıcı işlemi zaman aşımına uğradı."}
+
+    def _browser_thread_worker(self):
+        """Playwright eylemlerini sırayla ve tek bir thread üzerinde çalıştıran döngü."""
+        while not self._stop_event.is_set():
+            try:
+                # Poll queue for actions
+                req = self._queue.get(timeout=0.03)
+                action = req["action"]
+                kwargs = req["kwargs"]
+                resp_q = req["resp_q"]
+                
+                try:
+                    result = self._execute_thread_action(action, kwargs)
+                    resp_q.put(result)
+                except Exception as ex:
+                    resp_q.put(ex)
+            except queue.Empty:
+                # Playwright background events processing
+                if self.page:
+                    try:
+                        self.page.wait_for_timeout(15)
+                    except Exception:
+                        pass
+
+    def _execute_thread_action(self, action, kwargs):
+        if action == "ensure_started":
+            if self.page:
+                return (True, None)
+            if not PLAYWRIGHT_AVAILABLE:
+                return (False, "Tarayıcı kontrolü için 'playwright' kurulu değil. Kurmak için: pip install playwright && playwright install")
+            try:
+                self._playwright = sync_playwright().start()
+                ok, err = self._start_integrated_browser()
+                if not ok:
+                    return (False, err)
+
+                self.page = self.browser.pages[0] if self.browser.pages else self.browser.new_page()
+
+                try:
+                    vp = self.page.viewport_size
+                    if vp and vp.get("width") and vp.get("height"):
+                        self._page_size = (vp["width"], vp["height"])
+                except Exception:
+                    pass
+                self.cursor_pos = (self._page_size[0] // 2, self._page_size[1] // 2)
+                self._start_live_view()
+                return (True, None)
+            except Exception as e:
+                return (False, str(e))
+
+        elif action == "open_url":
+            url = kwargs.get("url")
+            if not url.startswith("http"):
+                url = "https://" + url
+            self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            return {"success": True, "url": self.page.url, "title": self.page.title()}
+
+        elif action == "click_element":
+            selector = kwargs.get("selector")
+            text = kwargs.get("text")
+            if text and not selector:
+                locator = self.page.get_by_text(text, exact=False).first
+            else:
+                locator = self.page.locator(selector).first
+            try:
+                box = locator.bounding_box(timeout=5000)
+                if box:
+                    cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+                    self.move_cursor_to(cx, cy)
+            except Exception:
+                pass
+            locator.click(timeout=10000)
+            return {"success": True}
+
+        elif action == "fill_element":
+            selector = kwargs.get("selector")
+            text = kwargs.get("text")
+            locator = self.page.locator(selector).first
+            try:
+                box = locator.bounding_box(timeout=5000)
+                if box:
+                    cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+                    self.move_cursor_to(cx, cy)
+            except Exception:
+                pass
+            locator.fill(text, timeout=10000)
+            return {"success": True}
+
+        elif action == "get_text":
+            selector = kwargs.get("selector", "body")
+            content = self.page.inner_text(selector, timeout=10000)
+            return {"content": content[:6000]}
+
+        elif action == "take_screenshot":
+            path = kwargs.get("path")
+            if not path:
+                ensure_config_dir()
+                path = str(TEMP_DIR / f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png")
+            self.page.screenshot(path=path)
+            return {"success": True, "path": path, "_temp_image": True}
+
+        elif action == "user_click":
+            x = kwargs.get("x")
+            y = kwargs.get("y")
+            self.move_cursor_to(x, y, duration=0.15)
+            self.page.mouse.click(x, y)
+            return True
+
+        elif action == "user_type":
+            text = kwargs.get("text")
             self.page.keyboard.type(text)
-        except Exception:
-            pass
+            return True
+
+        elif action == "is_active":
+            return self.page is not None
+
+        elif action == "close":
+            self._stop_live_view()
+            try:
+                if self.browser:
+                    self.browser.close()
+                if self._playwright:
+                    self._playwright.stop()
+            except Exception:
+                pass
+            self.browser = None
+            self.page = None
+            self._playwright = None
+            self._is_persistent = False
+            self._stop_event.set()
+            return True
+            
+        else:
+            raise ValueError(f"Bilinmeyen eylem: {action}")
 
     def current_page_size(self):
         return self._page_size
@@ -1044,8 +1203,7 @@ class BrowserController:
         return detect_installed_browsers()
 
     def _ask_choice(self, title, options):
-        """Genel amaçlı: (value, label) listesinden kullanıcıya seçtirir. stdin çakışmasını
-        önlemek için arka plandaki Enter/E dinleyicisini geçici olarak duraklatır."""
+        """Genel amaçlı: (value, label) listesinden kullanıcıya seçtirir."""
         key_listener_paused.set()
         try:
             if len(options) == 1:
@@ -1070,41 +1228,37 @@ class BrowserController:
             return None
         return self._ask_choice("Bilgisayarınızda bulunan tarayıcılar:", candidates)
 
-    def ensure_started(self, ask_if_multiple=True):
-        if self.page:
-            return True, None
-        if not PLAYWRIGHT_AVAILABLE:
-            return False, ("Tarayıcı kontrolü için 'playwright' kurulu değil. "
-                            "Kurmak için: pip install playwright && playwright install")
-        try:
-            self._playwright = sync_playwright().start()
-            ok, err = self._start_integrated_browser()
-            if not ok:
-                return False, err
+    def ensure_started(self):
+        return self._send_action("ensure_started")
 
-            self.page = self.browser.pages[0] if self.browser.pages else self.browser.new_page()
+    def open_url(self, url):
+        return self._send_action("open_url", url=url)
 
-            try:
-                vp = self.page.viewport_size
-                if vp and vp.get("width") and vp.get("height"):
-                    self._page_size = (vp["width"], vp["height"])
-            except Exception:
-                pass
-            self.cursor_pos = (self._page_size[0] // 2, self._page_size[1] // 2)
-            self._start_live_view()
-            return True, None
-        except Exception as e:
-            return False, str(e)
+    def click_element(self, selector=None, text=None):
+        return self._send_action("click_element", selector=selector, text=text)
+
+    def fill_element(self, selector, text):
+        return self._send_action("fill_element", selector=selector, text=text)
+
+    def get_text(self, selector="body"):
+        return self._send_action("get_text", selector=selector)
+
+    def take_screenshot(self, path=None):
+        return self._send_action("take_screenshot", path=path)
+
+    def user_click(self, x, y):
+        return self._send_action("user_click", x=x, y=y)
+
+    def user_type(self, text):
+        return self._send_action("user_type", text=text)
+
+    def is_active(self):
+        return self._send_action("is_active")
+
+    def close(self):
+        return self._send_action("close")
 
     def _start_integrated_browser(self):
-        """
-        AEGIS'in KENDİ dahili tarayıcısını başlatır — sistemdeki Chrome/Edge'e hiç
-        dokunmaz, kullanıcıya hiçbir şey sormaz. Playwright'ın kendi Chromium'unu,
-        AEGIS'e ait kalıcı bir profille (~/.gemini_agent/browser_profile) açar; bu
-        sayede girdiğin siteler, çerezler ve oturumlar (ör. bir siteye giriş yapman)
-        AEGIS kapatılıp açılsa bile hatırlanır. Otomasyon tespiti yapan sitelerde
-        engellenmemek için birkaç 'gerçek tarayıcı gibi görünme' ayarı da eklenir.
-        """
         BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         launch_args = [
             "--disable-blink-features=AutomationControlled",
@@ -1139,23 +1293,13 @@ class BrowserController:
         self.channel = "AEGIS dahili tarayıcı (kalıcı profil)"
         return True, None
 
-    # ---- Canlı izleme (CDP screencast) + sanal imleç ------------------
-
     def _start_live_view(self):
-        """
-        Chrome DevTools Protocol üzerinden sayfanın canlı ekran akışını (screencast)
-        başlatır ve ayrı bir pencerede (OpenCV) 30-60 FPS civarında gösterir.
-        Kullanıcının gerçek fare imleci DEĞİL; yapay zekanın tıkladığı/doldurduğu
-        yeri gösteren turuncu bir sanal imleç, her karenin üzerine çizilir.
-        """
         if not CV2_AVAILABLE:
             cprint("[dim]Canlı tarayıcı izleme için 'opencv-python' ve 'numpy' kurulu değil "
                    "(pip install opencv-python numpy). Tarayıcı yine de normal şekilde çalışacak.[/dim]"
                    if RICH_AVAILABLE else
                    "Canlı tarayıcı izleme için opencv-python ve numpy kurulu değil.")
             return
-        # GUI modunda ayrı bir masaüstü penceresi (cv2.imshow) yerine kareler doğrudan
-        # sohbet balonu içindeki gömülü görünüme (frame_callback) gönderilir.
         try:
             self._cdp = self.page.context.new_cdp_session(self.page)
         except Exception as e:
@@ -1163,8 +1307,6 @@ class BrowserController:
             return
 
         def on_frame(params):
-            # Chrome, bir sonraki kareyi göndermeden önce bu karenin onaylanmasını
-            # (ack) bekler; onaylanmazsa akış durur.
             try:
                 self._cdp.send("Page.screencastFrameAck", {"sessionId": params["sessionId"]})
             except Exception:
@@ -1199,7 +1341,6 @@ class BrowserController:
                if RICH_AVAILABLE else "Canlı tarayıcı penceresi açıldı.")
 
     def _draw_virtual_cursor(self, frame, x, y):
-        """Kullanıcının gerçek imlecinden ayırt edilebilir, turuncu bir sanal imleç çizer."""
         color = (0, 165, 255)  # BGR: turuncu
         cv2.circle(frame, (x, y), 14, color, 2, lineType=cv2.LINE_AA)
         cv2.circle(frame, (x, y), 3, color, -1, lineType=cv2.LINE_AA)
@@ -1268,36 +1409,16 @@ class BrowserController:
         self._cdp = None
 
     def move_cursor_to(self, x, y, duration=0.3, fps=60):
-        """
-        Sanal imleci mevcut konumundan (x, y) hedefine, yumuşak (ease-out) bir
-        yörüngeyle, ~60 FPS'e kadar aralıklarla kaydırarak hareket ettirir.
-        Canlı izleme penceresi her karede self.cursor_pos'u okuduğu için bu,
-        gerçek bir "imleç kayması" animasyonu olarak görünür.
-        """
         steps = max(int(duration * fps), 1)
         start_x, start_y = self.cursor_pos
         for i in range(1, steps + 1):
             t = i / steps
-            eased = 1 - (1 - t) ** 2  # ease-out: hızlı başlar, yavaşlayarak durur
+            eased = 1 - (1 - t) ** 2  # ease-out
             ix = start_x + (x - start_x) * eased
             iy = start_y + (y - start_y) * eased
             self.cursor_pos = (ix, iy)
             time.sleep(1.0 / fps)
         self.cursor_pos = (x, y)
-
-    def close(self):
-        self._stop_live_view()
-        try:
-            if self.browser:
-                self.browser.close()
-            if self._playwright:
-                self._playwright.stop()
-        except Exception:
-            pass
-        self.browser = None
-        self.page = None
-        self._playwright = None
-        self._is_persistent = False
 
 
 _browser = BrowserController()
@@ -1308,65 +1429,28 @@ def tool_browser_open(url: str) -> dict:
     ok, err = _browser.ensure_started()
     if not ok:
         return {"error": err}
-    try:
-        if not url.startswith("http"):
-            url = "https://" + url
-        _browser.page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        return {"success": True, "url": _browser.page.url, "title": _browser.page.title()}
-    except Exception as e:
-        return {"error": str(e)}
+    return _browser.open_url(url)
 
 
 def tool_browser_click(selector: str = None, text: str = None) -> dict:
     """Bir elementi CSS seçici veya görünür metniyle tıklar (önce sanal imleç hedefe taşınır)."""
-    if not _browser.page:
+    if not _browser.is_active():
         return {"error": "Tarayıcı açık değil. Önce browser_open kullanın."}
-    try:
-        if text and not selector:
-            locator = _browser.page.get_by_text(text, exact=False).first
-        else:
-            locator = _browser.page.locator(selector).first
-        try:
-            box = locator.bounding_box(timeout=5000)
-            if box:
-                cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
-                _browser.move_cursor_to(cx, cy)
-        except Exception:
-            pass
-        locator.click(timeout=10000)
-        return {"success": True}
-    except Exception as e:
-        return {"error": str(e)}
+    return _browser.click_element(selector, text)
 
 
 def tool_browser_fill(selector: str, text: str) -> dict:
     """Bir input/textarea alanına CSS seçiciyle metin yazar (önce sanal imleç hedefe taşınır)."""
-    if not _browser.page:
+    if not _browser.is_active():
         return {"error": "Tarayıcı açık değil. Önce browser_open kullanın."}
-    try:
-        locator = _browser.page.locator(selector).first
-        try:
-            box = locator.bounding_box(timeout=5000)
-            if box:
-                cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
-                _browser.move_cursor_to(cx, cy)
-        except Exception:
-            pass
-        locator.fill(text, timeout=10000)
-        return {"success": True}
-    except Exception as e:
-        return {"error": str(e)}
+    return _browser.fill_element(selector, text)
 
 
 def tool_browser_get_text(selector: str = "body") -> dict:
     """Sayfadaki (veya bir elementin) görünür metnini döner."""
-    if not _browser.page:
+    if not _browser.is_active():
         return {"error": "Tarayıcı açık değil. Önce browser_open kullanın."}
-    try:
-        content = _browser.page.inner_text(selector, timeout=10000)
-        return {"content": content[:6000]}
-    except Exception as e:
-        return {"error": str(e)}
+    return _browser.get_text(selector)
 
 
 def tool_browser_wait_for_user(message: str = "Lütfen doğrulamayı (CAPTCHA vb.) tamamlayın.") -> dict:
@@ -1389,20 +1473,11 @@ def tool_browser_wait_for_user(message: str = "Lütfen doğrulamayı (CAPTCHA vb
 
 def tool_browser_screenshot(path: str = None) -> dict:
     """
-    Mevcut sayfanın ekran görüntüsünü alır. Masaüstüne değil, geçici bir klasöre
-    kaydedilir; model görüntüye baktıktan hemen sonra dosya otomatik olarak silinir
-    (bu yüzden 'success' sonucuna görüntünün base64 verisi de eklenir; asıl silme
-    işlemi bu fonksiyonu çağıran _execute_tool içinde yapılır).
+    Mevcut sayfanın ekran görüntüsünü alır.
     """
-    if not _browser.page:
+    if not _browser.is_active():
         return {"error": "Tarayıcı açık değil. Önce browser_open kullanın."}
-    ensure_config_dir()
-    tmp_path = TEMP_DIR / f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
-    try:
-        _browser.page.screenshot(path=str(tmp_path))
-        return {"success": True, "path": str(tmp_path), "_temp_image": True}
-    except Exception as e:
-        return {"error": str(e)}
+    return _browser.take_screenshot(path)
 
 
 def tool_browser_close(dummy: str = None) -> dict:
@@ -1420,6 +1495,7 @@ TOOL_FUNCTIONS.update({
     "browser_screenshot": tool_browser_screenshot,
     "browser_close": tool_browser_close,
 })
+
 
 # Gemini function-calling şeması
 GEMINI_TOOLS = [
@@ -2286,32 +2362,28 @@ def prompt_parallel_tasks():
 # --------------------------------------------------------------------------
 
 class VoiceController:
-    """Mikrofon ile komut alma (SpeechRecognition) + TTS ile yanıt okuma (pyttsx3)."""
+    """Mikrofon ile komut alma (SpeechRecognition) + Google TTS & Windows MCI ile Türkçe sesli konuşma."""
 
     def __init__(self):
         self.enabled = False
-        self._tts_engine = None
         self._recognizer = None
+        self._playback_active = False
+        self._interrupt_event = threading.Event()
         if SPEECH_RECOGNITION_AVAILABLE:
             self._recognizer = sr.Recognizer()
-        if TTS_AVAILABLE:
-            try:
-                self._tts_engine = pyttsx3.init()
-            except Exception:
-                self._tts_engine = None
 
     def available(self):
-        return SPEECH_RECOGNITION_AVAILABLE and self._recognizer is not None
+        return SPEECH_RECOGNITION_AVAILABLE and self._recognizer is not None and GTTS_AVAILABLE
 
     def listen_once(self, language="tr-TR", timeout=8):
         """Mikrofondan tek bir komut dinler, metne çevirip döner (hata olursa None)."""
         if not self.available():
-            return None, "SpeechRecognition/pyaudio kurulu değil. Kurulum: pip install SpeechRecognition pyaudio"
+            return None, "SpeechRecognition veya gTTS kütüphaneleri kurulu değil."
         try:
             with sr.Microphone() as source:
                 self._recognizer.adjust_for_ambient_noise(source, duration=0.5)
                 cprint("[dim]🎤 Dinliyorum...[/dim]" if RICH_AVAILABLE else "🎤 Dinliyorum...")
-                audio = self._recognizer.listen(source, timeout=timeout, phrase_time_limit=20)
+                audio = self._recognizer.listen(source, timeout=timeout, phrase_time_limit=15)
             text = self._recognizer.recognize_google(audio, language=language)
             return text, None
         except sr.WaitTimeoutError:
@@ -2321,18 +2393,81 @@ class VoiceController:
         except Exception as e:
             return None, str(e)
 
-    def speak(self, text):
-        """Verilen metni TTS ile seslendirir (kuruluysa)."""
-        if not TTS_AVAILABLE or not self._tts_engine or not text:
-            return False
+    def stop_playback(self):
+        """Çalmakta olan sesi hemen keser."""
+        self._interrupt_event.set()
         try:
-            # Kod bloklarını ve markdown işaretlerini seslendirmeden önce temizle
-            clean = re.sub(r"```.*?```", " kod bloğu ", text, flags=re.DOTALL)
-            clean = re.sub(r"[*_#`]", "", clean)
-            self._tts_engine.say(clean[:2000])
-            self._tts_engine.runAndWait()
-            return True
+            ctypes.windll.winmm.mciSendStringW('stop tts_play', None, 0, 0)
+            ctypes.windll.winmm.mciSendStringW('close tts_play', None, 0, 0)
         except Exception:
+            pass
+        self._playback_active = False
+
+    def speak(self, text, active_check_fn=None):
+        """Verilen metni gTTS ile Türkçe seslendirir ve asenkron oynatıp kesinti denetimi yapar."""
+        if not GTTS_AVAILABLE or not text:
+            return False
+            
+        self.stop_playback() # Ensure previous is stopped
+        self._interrupt_event.clear()
+        self._playback_active = True
+        
+        # Clean text from markdown/code blocks for cleaner speech
+        clean = re.sub(r"```.*?```", " kod bloğu ", text, flags=re.DOTALL)
+        clean = re.sub(r"[*_#`]", "", clean)
+        clean = clean.strip()
+        if not clean:
+            return False
+            
+        ensure_config_dir()
+        temp_audio = str(TEMP_DIR / f"tts_{int(time.time()*1000)}.mp3")
+        
+        try:
+            tts = gTTS(text=clean[:2000], lang="tr")
+            tts.save(temp_audio)
+            
+            # Open MCI
+            ctypes.windll.winmm.mciSendStringW(f'open "{os.path.abspath(temp_audio)}" type mpegvideo alias tts_play', None, 0, 0)
+            
+            # Start playing
+            ctypes.windll.winmm.mciSendStringW('play tts_play', None, 0, 0)
+            
+            def get_mci_mode():
+                buf = ctypes.create_unicode_buffer(64)
+                ctypes.windll.winmm.mciSendStringW('status tts_play mode', buf, 64, 0)
+                return buf.value.strip().lower()
+                
+            # Wait loop with early interruption check
+            time.sleep(0.2) # Allow playback to start
+            while self._playback_active and not self._interrupt_event.is_set():
+                if active_check_fn and not active_check_fn():
+                    break
+                mode = get_mci_mode()
+                if mode not in ("playing", "transitioning"):
+                    break
+                time.sleep(0.1)
+                
+            # Stop and close
+            ctypes.windll.winmm.mciSendStringW('stop tts_play', None, 0, 0)
+            ctypes.windll.winmm.mciSendStringW('close tts_play', None, 0, 0)
+            
+            # Cleanup temp file
+            time.sleep(0.15)
+            if os.path.exists(temp_audio):
+                try:
+                    os.remove(temp_audio)
+                except Exception:
+                    pass
+            self._playback_active = False
+            return True
+        except Exception as e:
+            print("Speech playback error:", e)
+            self._playback_active = False
+            if os.path.exists(temp_audio):
+                try:
+                    os.remove(temp_audio)
+                except Exception:
+                    pass
             return False
 
 
@@ -2484,6 +2619,22 @@ def draw_icon(parent, kind, size=22, color=COL_TEXT, bg=None):
     bg = bg or (parent.cget("fg_color") if hasattr(parent, "cget") else COL_BG)
     if isinstance(bg, (list, tuple)):
         bg = bg[-1]
+    if bg == "transparent":
+        bg = COL_BG
+        curr = parent
+        while curr:
+            try:
+                c_bg = curr.cget("fg_color")
+                if isinstance(c_bg, (list, tuple)):
+                    c_bg = c_bg[-1]
+                if c_bg and c_bg != "transparent":
+                    bg = c_bg
+                    break
+            except Exception:
+                pass
+            curr = getattr(curr, "master", None)
+        if isinstance(bg, (list, tuple)):
+            bg = bg[-1]
     c = tk.Canvas(parent, width=size, height=size, bg=bg, highlightthickness=0, bd=0)
     cx = cy = size / 2
 
@@ -2575,6 +2726,21 @@ def draw_icon(parent, kind, size=22, color=COL_TEXT, bg=None):
         c.create_line(cx - w * 0.7, cy + h * 1.15, cx + w * 0.7, cy + h * 1.15,
                        fill=color, width=max(2, size // 11), capstyle="round")
 
+    elif kind == "person":
+        r = size * 0.16
+        c.create_oval(cx - r, cy - size * 0.28, cx + r, cy - size * 0.08, fill=color, outline="")
+        c.create_arc(cx - size * 0.28, cy, cx + size * 0.28, cy + size * 0.5,
+                     start=0, extent=180, fill=color, outline="")
+
+    elif kind == "logout":
+        w = max(2, size // 10)
+        c.create_line(cx - size * 0.1, cy - size * 0.3, cx - size * 0.3, cy - size * 0.3, fill=color, width=w)
+        c.create_line(cx - size * 0.3, cy - size * 0.3, cx - size * 0.3, cy + size * 0.3, fill=color, width=w)
+        c.create_line(cx - size * 0.3, cy + size * 0.3, cx - size * 0.1, cy + size * 0.3, fill=color, width=w)
+        c.create_line(cx - size * 0.1, cy, cx + size * 0.3, cy, fill=color, width=w)
+        c.create_line(cx + size * 0.1, cy - size * 0.15, cx + size * 0.3, cy, fill=color, width=w)
+        c.create_line(cx + size * 0.1, cy + size * 0.15, cx + size * 0.3, cy, fill=color, width=w)
+
     return c
 
 
@@ -2626,6 +2792,45 @@ class IconButton(_BaseFrame):
 # Sohbet balonu widget'ı
 # ============================================================================
 
+class RichTextLabel(tk.Text):
+    """Markdown bold tags (**bold**) ve otomatik yükseklik ayarını destekleyen zengin metin kutusu."""
+    def __init__(self, master, font_family, font_size, text_color, bg_color, is_system=False, **kwargs):
+        font_style = "italic" if is_system else "normal"
+        super().__init__(
+            master, wrap="word", bg=bg_color, fg=text_color,
+            font=(font_family, font_size, font_style), bd=0, highlightthickness=0,
+            state="disabled", cursor="arrow", width=62, **kwargs
+        )
+        self.font_family = font_family
+        self.font_size = font_size
+        self.is_system = is_system
+        self.tag_configure("bold", font=(font_family, font_size, "bold"))
+        self.tag_configure("normal", font=(font_family, font_size, font_style))
+
+    def set_text(self, text):
+        self.config(state="normal")
+        self.delete("1.0", "end")
+        
+        # Simple markdown bold parser **text**
+        pattern = re.compile(r'\*\*(.*?)\*\*')
+        last_idx = 0
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            if start > last_idx:
+                self.insert("end", text[last_idx:start], "normal")
+            self.insert("end", match.group(1), "bold")
+            last_idx = end
+        if last_idx < len(text):
+            self.insert("end", text[last_idx:], "normal")
+            
+        self.config(state="disabled")
+        
+        # Auto height calculation
+        self.update_idletasks()
+        line_count = int(self.index("end-1c").split(".")[0])
+        self.config(height=line_count)
+
+
 class ChatBubble(_BaseFrame):
     def __init__(self, master, role, text="", **kwargs):
         is_user = role == "user"
@@ -2651,16 +2856,15 @@ class ChatBubble(_BaseFrame):
         self.bubble.pack(anchor=anchor_side, padx=4, pady=(0, 2))
 
         self.text_var = text
-        self.label = ctk.CTkLabel(
-            self.bubble, text=text or "...", justify="left", anchor="w",
-            font=(FONT_FAMILY, 13, "italic" if is_system else "normal"),
-            text_color=text_color, wraplength=560,
+        self.label = RichTextLabel(
+            self.bubble, FONT_FAMILY, 13, text_color, bubble_color, is_system=is_system
         )
-        self.label.pack(padx=14, pady=(9, 9) if is_system else (10, 10))
+        self.label.pack(padx=14, pady=10)
+        self.label.set_text(text or "...")
 
     def update_text(self, text):
         self.text_var = text
-        self.label.configure(text=text or "...")
+        self.label.set_text(text or "...")
 
 
 class BrowserBubble(_BaseFrame):
@@ -2845,6 +3049,165 @@ class BrowserBubble(_BaseFrame):
 # Ana Uygulama
 # ============================================================================
 
+# ============================================================================
+# OAuth Google Callback HTTP Server
+# ============================================================================
+
+class OAuthCallbackHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass # Suppress logging to keep output clean
+        
+    def do_GET(self):
+        parsed_url = urllib.parse.urlparse(self.path)
+        path = parsed_url.path
+        query = urllib.parse.parse_qs(parsed_url.query)
+        
+        if path == "/login":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <title>Google ile Giriş Yap - Aegis</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+                <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+                <style>body { font-family: 'Roboto', sans-serif; }</style>
+            </head>
+            <body class="bg-gray-50 flex items-center justify-center min-h-screen">
+                <div class="bg-white p-8 rounded-lg shadow-md w-full max-w-md border border-gray-200">
+                    <div class="flex flex-col items-center mb-6">
+                        <svg class="h-10 w-10 mb-4" viewBox="0 0 24 24" width="24px" height="24px">
+                            <path fill="#EA4335" d="M20,12.5c0-0.7-0.1-1.4-0.2-2H12v3.9h4.5c-0.2,1-0.8,1.9-1.7,2.5v2.1h2.7C19.1,17.2,20,15,20,12.5z"/>
+                            <path fill="#4285F4" d="M12,20.5c2.2,0,4-0.7,5.3-2l-2.7-2.1c-0.7,0.5-1.7,0.8-2.6,0.8c-2,0-3.8-1.4-4.4-3.2H4.8v2.1C6.2,18.7,8.9,20.5,12,20.5z"/>
+                            <path fill="#FBBC05" d="M7.6,14c-0.1-0.5-0.2-1-0.2-1.5s0.1-1,0.2-1.5V8.9H4.8C4.3,9.8,4,10.9,4,12s0.3,2.2,0.8,3.1L7.6,14z"/>
+                            <path fill="#34A853" d="M12,7.5c1.2,0,2.3,0.4,3.1,1.2l2.3-2.3C16,5.1,14.2,4.5,12,4.5c-3.1,0-5.8,1.8-7.2,4.4l2.8,2.1C8.2,9.2,10,7.5,12,7.5z"/>
+                        </svg>
+                        <h1 class="text-xl font-medium text-gray-800">Hesap seçin</h1>
+                        <p class="text-sm text-gray-500 mt-1">Aegis Agent uygulamasına devam etmek için</p>
+                    </div>
+                    
+                    <div class="space-y-3">
+                        <button onclick="selectAccount('erene@example.com', 'Eren Ekinci', 'https://lh3.googleusercontent.com/a/default-user')" class="w-full flex items-center p-3 border border-gray-200 rounded-lg hover:bg-gray-50 transition cursor-pointer text-left">
+                            <div class="h-10 w-10 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold text-lg mr-3">E</div>
+                            <div>
+                                <p class="text-sm font-medium text-gray-700">Eren Ekinci</p>
+                                <p class="text-xs text-gray-500">erene@example.com</p>
+                            </div>
+                        </button>
+                        
+                        <div class="border-t border-gray-200 my-4 pt-4">
+                            <label class="block text-xs font-medium text-gray-500 mb-1">Başka bir hesap kullan</label>
+                            <div class="flex space-x-2">
+                                <input type="email" id="custom_email" placeholder="email@gmail.com" class="flex-1 p-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-1 focus:ring-blue-500">
+                                <button onclick="selectCustom()" class="bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium px-4 py-2 rounded transition cursor-pointer">Giriş Yap</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <script>
+                    function selectAccount(email, name, avatar) {
+                        const token = "sandbox_" + email + ":" + name + ":" + avatar;
+                        window.location.href = "/callback?id_token=" + encodeURIComponent(token);
+                    }
+                    function selectCustom() {
+                        const email = document.getElementById("custom_email").value.trim();
+                        if (!email || !email.includes("@")) {
+                            alert("Lütfen geçerli bir e-posta adresi girin.");
+                            return;
+                        }
+                        const name = email.split("@")[0];
+                        selectAccount(email, name.charAt(0).toUpperCase() + name.slice(1), "");
+                    }
+                </script>
+            </body>
+            </html>
+            """
+            self.wfile.write(html.encode("utf-8"))
+            
+        elif path == "/callback":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            
+            html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <title>Doğrulanıyor... - Aegis</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="bg-gray-50 flex items-center justify-center min-h-screen">
+                <div class="bg-white p-8 rounded-lg shadow-md w-full max-w-md border border-gray-200 text-center">
+                    <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
+                    <h1 class="text-xl font-bold text-gray-800 mb-2">Kimlik Doğrulanıyor...</h1>
+                    <p class="text-gray-600">Lütfen bekleyin, Aegis uygulamasına yönlendiriliyorsunuz.</p>
+                </div>
+                <script>
+                    const hash = window.location.hash.substring(1);
+                    const params = new URLSearchParams(hash);
+                    const id_token = params.get("id_token");
+                    const state = params.get("state");
+                    if (id_token) {
+                        window.location.href = "/token_received?id_token=" + encodeURIComponent(id_token) + "&state=" + encodeURIComponent(state);
+                    } else {
+                        const urlParams = new URLSearchParams(window.location.search);
+                        const q_id_token = urlParams.get("id_token") || urlParams.get("code");
+                        if (q_id_token) {
+                            window.location.href = "/token_received?id_token=" + encodeURIComponent(q_id_token);
+                        } else {
+                            document.body.innerHTML = `
+                            <div class="bg-white p-8 rounded-lg shadow-md w-full max-w-md border border-gray-200 text-center mx-auto mt-20">
+                                <h2 class="text-xl font-bold text-red-600 mb-2">Giriş Hatası</h2>
+                                <p class="text-gray-600">Google'dan kimlik doğrulama token'ı alınamadı.</p>
+                            </div>`;
+                        }
+                    }
+                </script>
+            </body>
+            </html>
+            """
+            self.wfile.write(html.encode("utf-8"))
+            
+        elif path == "/token_received":
+            token = query.get("id_token", [""])[0]
+            self.server.received_token = token
+            
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            
+            html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <title>Giriş Başarılı - Aegis</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="bg-gray-50 flex items-center justify-center min-h-screen">
+                <div class="bg-white p-8 rounded-lg shadow-md w-full max-w-md border border-gray-200 text-center">
+                    <div class="text-green-500 mb-4">
+                        <svg class="h-16 w-16 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                    </div>
+                    <h1 class="text-2xl font-bold text-gray-800 mb-2">Giriş Başarılı!</h1>
+                    <p class="text-gray-600 mb-6">Aegis uygulaması kimliğinizi doğruladı. Bu tarayıcı sekmesini kapatabilirsiniz.</p>
+                </div>
+            </body>
+            </html>
+            """
+            self.wfile.write(html.encode("utf-8"))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
 class AegisApp(_BaseApp):
     def __init__(self):
         super().__init__()
@@ -2853,19 +3216,6 @@ class AegisApp(_BaseApp):
         self.minsize(880, 580)
         self.configure(fg_color=COL_BG)
 
-        self.cfg = load_config()
-        if not self.cfg.get("api_keys"):
-            self._first_time_setup_gui()
-
-        self.key_manager = KeyManager(
-            self.cfg["api_keys"], self.cfg.get("model", DEFAULT_MODEL),
-            on_switch_callback=self._on_key_switch,
-        )
-        self.engine = ChatEngine(
-            self.key_manager, self.cfg.get("model", DEFAULT_MODEL),
-            response_language=self.cfg.get("response_language", "tr"),
-        )
-
         self._ui_queue = queue.Queue()
         self._cancel_event = None
         self._busy = False
@@ -2873,12 +3223,19 @@ class AegisApp(_BaseApp):
         self._browser_bubble_shown = False
         self._steer_pending_text = None
 
-        self._build_layout()
-        self._refresh_key_summary()
-        self._refresh_session_list()
-        self.after(80, self._poll_queue)
+        self.current_user = None
+        self.access_token = None
+        self.refresh_token = None
 
+        self.after(80, self._poll_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Check keyring session
+        self.load_session_from_keyring()
+        if self.current_user is None:
+            self.show_login_screen()
+        else:
+            self.start_app()
 
     # ------------------------------------------------------------------
     # İlk kurulum
@@ -2942,6 +3299,212 @@ class AegisApp(_BaseApp):
             sys.exit(0)
 
     # ------------------------------------------------------------------
+    # Giriş Sistemi & Cihaz Oturum Yönetimi
+    # ------------------------------------------------------------------
+
+    def load_session_from_keyring(self):
+        try:
+            self.access_token = keyring.get_password("aegis", "access_token")
+            self.refresh_token = keyring.get_password("aegis", "refresh_token")
+            
+            if self.access_token and self.refresh_token:
+                headers = {"Authorization": f"Bearer {self.access_token}"}
+                r = requests.get("http://localhost:8000/auth/me", headers=headers, timeout=5)
+                if r.status_code == 200:
+                    self.current_user = r.json()
+                    print(f"[INFO] Restored session from keyring: {self.current_user['email']}")
+                    return
+                elif r.status_code == 401:
+                    # Token expired, try refresh
+                    headers = {"X-Refresh-Token": self.refresh_token}
+                    rr = requests.post("http://localhost:8000/auth/refresh", headers=headers, timeout=5)
+                    if rr.status_code == 200:
+                        data = rr.json()
+                        self.access_token = data["access_token"]
+                        new_refresh = rr.cookies.get("refresh_token")
+                        if new_refresh:
+                            self.refresh_token = new_refresh
+                        
+                        keyring.set_password("aegis", "access_token", self.access_token)
+                        if new_refresh:
+                            keyring.set_password("aegis", "refresh_token", self.refresh_token)
+                            
+                        # Re-verify
+                        headers_new = {"Authorization": f"Bearer {self.access_token}"}
+                        r_new = requests.get("http://localhost:8000/auth/me", headers=headers_new, timeout=5)
+                        if r_new.status_code == 200:
+                            self.current_user = r_new.json()
+                            print(f"[INFO] Refreshed session from keyring: {self.current_user['email']}")
+                            return
+        except Exception as e:
+            print(f"[WARNING] Failed to load session from keyring: {e}")
+            
+        self.clear_session()
+
+    def clear_session(self):
+        self.current_user = None
+        self.access_token = None
+        self.refresh_token = None
+        try:
+            keyring.delete_password("aegis", "access_token")
+        except Exception:
+            pass
+        try:
+            keyring.delete_password("aegis", "refresh_token")
+        except Exception:
+            pass
+
+    def show_login_screen(self):
+        # Clear main window frames
+        for w in self.winfo_children():
+            w.destroy()
+            
+        self.login_frame = ctk.CTkFrame(self, fg_color=COL_BG)
+        self.login_frame.pack(fill="both", expand=True)
+        
+        card = ctk.CTkFrame(self.login_frame, width=400, height=450, fg_color=COL_SIDEBAR, corner_radius=20, border_width=1, border_color=COL_BORDER)
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        
+        logo_frame = ctk.CTkFrame(card, fg_color="transparent")
+        logo_frame.pack(pady=(50, 10))
+        draw_icon(logo_frame, "shield", size=60, color=COL_ACCENT, bg=COL_SIDEBAR).pack()
+        
+        ctk.CTkLabel(card, text="AEGIS'E HOŞ GELDİNİZ", font=(FONT_FAMILY, 20, "bold"), text_color=COL_TEXT).pack(pady=4)
+        ctk.CTkLabel(card, text="Güvenli yazılım geliştirme ajanı", font=(FONT_FAMILY, 12), text_color=COL_TEXT_DIM).pack(pady=(0, 40))
+        
+        self.login_status_label = ctk.CTkLabel(card, text="Lütfen Google hesabınızla giriş yapın", font=(FONT_FAMILY, 12), text_color=COL_TEXT_DIM)
+        self.login_status_label.pack(pady=10)
+        
+        btn_google = ctk.CTkButton(
+            card,
+            text="Google ile Giriş Yap",
+            font=(FONT_FAMILY, 14, "bold"),
+            fg_color=COL_ACCENT,
+            hover_color=COL_ACCENT_HOVER,
+            height=45,
+            width=280,
+            command=self.start_google_login_flow
+        )
+        btn_google.pack(pady=20)
+
+    def start_google_login_flow(self):
+        self.login_status_label.configure(text="Tarayıcı açılıyor...", text_color=COL_TEXT)
+        self.update()
+        
+        try:
+            r = requests.get("http://localhost:8000/auth/config", timeout=5)
+            config_data = r.json()
+            client_id = config_data.get("google_client_id", "sandbox")
+        except Exception:
+            messagebox.showerror("Hata", "Kimlik doğrulama sunucusu (backend) çalışmıyor!\nLütfen backend servisini başlatıp tekrar deneyin.")
+            self.login_status_label.configure(text="Bağlantı hatası: Sunucu kapalı", text_color="red")
+            return
+            
+        def auth_thread():
+            try:
+                import uuid
+                server = HTTPServer(("localhost", 8080), OAuthCallbackHandler)
+                server.received_token = None
+                server.timeout = 120
+                
+                if client_id == "sandbox":
+                    url = "http://localhost:8080/login"
+                else:
+                    # Construct official Google OAuth 2.0 URL (Implicit flow for localhost)
+                    state = uuid.uuid4().hex
+                    nonce = uuid.uuid4().hex
+                    url = (
+                        f"https://accounts.google.com/o/oauth2/v2/auth?"
+                        f"client_id={client_id}&"
+                        f"redirect_uri=http://localhost:8080/callback&"
+                        f"response_type=id_token&"
+                        f"scope=openid%20email%20profile&"
+                        f"state={state}&"
+                        f"nonce={nonce}"
+                    )
+                
+                webbrowser.open(url)
+                
+                while server.received_token is None:
+                    server.handle_request()
+                server.server_close()
+                
+                token = server.received_token
+                if token:
+                    self._ui_queue.put(("login_backend", token))
+                else:
+                    self._ui_queue.put(("login_status", "Giriş işlemi iptal edildi."))
+            except Exception as e:
+                self._ui_queue.put(("login_status", f"Hata: {str(e)}"))
+                
+        threading.Thread(target=auth_thread, daemon=True).start()
+
+    def login_backend(self, id_token):
+        self.login_status_label.configure(text="Oturum doğrulanıyor...", text_color=COL_TEXT)
+        self.update()
+        
+        try:
+            payload = {"id_token": id_token}
+            r = requests.post("http://localhost:8000/auth/google", json=payload, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                self.access_token = data["access_token"]
+                new_refresh = r.cookies.get("refresh_token")
+                if new_refresh:
+                    self.refresh_token = new_refresh
+                
+                keyring.set_password("aegis", "access_token", self.access_token)
+                if self.refresh_token:
+                    keyring.set_password("aegis", "refresh_token", self.refresh_token)
+                
+                headers = {"Authorization": f"Bearer {self.access_token}"}
+                me_r = requests.get("http://localhost:8000/auth/me", headers=headers, timeout=5)
+                if me_r.status_code == 200:
+                    self.current_user = me_r.json()
+                    self.login_status_label.configure(text="Giriş başarılı! Yükleniyor...", text_color="green")
+                    self.update()
+                    time.sleep(0.5)
+                    self.start_app()
+                else:
+                    self.login_status_label.configure(text="Profil bilgileri alınamadı.", text_color="red")
+            else:
+                detail = r.json().get("detail", "Bilinmeyen hata")
+                self.login_status_label.configure(text=f"Doğrulama hatası: {detail}", text_color="red")
+        except Exception as e:
+            self.login_status_label.configure(text=f"Hata: {str(e)}", text_color="red")
+
+    def _logout(self):
+        if messagebox.askyesno("Çıkış Yap", "Oturumunuzu kapatmak istediğinize emin misiniz?"):
+            try:
+                headers = {"Authorization": f"Bearer {self.access_token}"}
+                requests.post("http://localhost:8000/auth/logout", headers=headers, timeout=5)
+            except Exception:
+                pass
+            self.clear_session()
+            self.show_login_screen()
+
+    def start_app(self):
+        if hasattr(self, "login_frame"):
+            self.login_frame.destroy()
+            
+        self.cfg = load_config()
+        if not self.cfg.get("api_keys"):
+            self._first_time_setup_gui()
+
+        self.key_manager = KeyManager(
+            self.cfg["api_keys"], self.cfg.get("model", DEFAULT_MODEL),
+            on_switch_callback=self._on_key_switch,
+        )
+        self.engine = ChatEngine(
+            self.key_manager, self.cfg.get("model", DEFAULT_MODEL),
+            response_language=self.cfg.get("response_language", "tr"),
+        )
+        
+        self._build_layout()
+        self._refresh_key_summary()
+        self._refresh_session_list()
+
+    # ------------------------------------------------------------------
     # Layout
     # ------------------------------------------------------------------
 
@@ -2959,6 +3522,14 @@ class AegisApp(_BaseApp):
         draw_icon(header, "shield", size=26, color=COL_ACCENT, bg=COL_SIDEBAR).pack(side="left", padx=(0, 8))
         ctk.CTkLabel(header, text="AEGIS AGENT", font=(FONT_FAMILY, 18, "bold"),
                      text_color=COL_TEXT).pack(side="left")
+
+        # Voice Mode Button in the sidebar header
+        self.voice_toggle_btn = IconButton(
+            header, "mic", command=self.toggle_voice_mode,
+            size=30, icon_size=16, fg_color=COL_SIDEBAR,
+            hover_color=COL_SURFACE_HOVER, icon_color=COL_TEXT_DIM
+        )
+        self.voice_toggle_btn.pack(side="right", padx=(8, 0))
 
         ctk.CTkLabel(sidebar, text="Kod odaklı yapay zeka ajanı", font=(FONT_FAMILY, 11),
                      text_color=COL_TEXT_DIM).pack(pady=(0, 18), padx=18, anchor="w")
@@ -2983,6 +3554,26 @@ class AegisApp(_BaseApp):
         self.key_summary_label = ctk.CTkLabel(bottom_bar, text="", font=(FONT_FAMILY, 11),
                                                text_color=COL_TEXT_DIM, anchor="w")
         self.key_summary_label.pack(fill="x", pady=(0, 8))
+
+        if self.current_user:
+            profile_frame = ctk.CTkFrame(bottom_bar, fg_color=COL_SURFACE, corner_radius=10, height=44)
+            profile_frame.pack(fill="x", pady=(0, 8))
+            profile_frame.pack_propagate(False)
+            
+            draw_icon(profile_frame, "person", size=18, color=COL_TEXT_DIM, bg=COL_SURFACE).place(x=14, rely=0.5, anchor="w")
+            
+            user_lbl = ctk.CTkLabel(profile_frame, text=self.current_user.get("name", "User"), font=(FONT_FAMILY, 11, "bold"), text_color=COL_TEXT)
+            user_lbl.place(x=42, rely=0.3, anchor="w")
+            
+            email_lbl = ctk.CTkLabel(profile_frame, text=self.current_user.get("email", ""), font=(FONT_FAMILY, 9), text_color=COL_TEXT_DIM)
+            email_lbl.place(x=42, rely=0.7, anchor="w")
+            
+            logout_btn = IconButton(
+                profile_frame, "logout", command=self._logout,
+                size=28, icon_size=14, fg_color="transparent",
+                hover_color=COL_SURFACE_HOVER, icon_color="red"
+            )
+            logout_btn.place(relx=0.9, rely=0.5, anchor="center")
 
         settings_row = ctk.CTkFrame(bottom_bar, fg_color=COL_SURFACE, corner_radius=10, height=42)
         settings_row.pack(fill="x")
@@ -3036,6 +3627,7 @@ class AegisApp(_BaseApp):
         self.input_box.grid(row=0, column=1, sticky="we", pady=8)
         self.input_box.bind("<Return>", self._on_enter_pressed)
         self.input_box.bind("<Shift-Return>", lambda e: None)
+        self.input_box.bind("<KeyRelease>", self._on_input_key_release)
 
         model_holder = ctk.CTkFrame(input_bar, fg_color="transparent")
         model_holder.grid(row=0, column=2, padx=(4, 4), pady=8)
@@ -3117,6 +3709,12 @@ class AegisApp(_BaseApp):
         self._send_message()
         return "break"
 
+    def _on_input_key_release(self, event):
+        # Eğer durum çubuğunda hata veya durduruldu mesajı varsa, kullanıcı yazmaya başladığında bunu temizle.
+        current_status = self.status_label.cget("text")
+        if current_status and (current_status.startswith("Hata:") or current_status.startswith("İptal edildi") or current_status.startswith("Durduruldu")):
+            self._set_status("Hazır", COL_TEXT_DIM)
+
     def _send_message(self):
         text = self.input_box.get("1.0", "end").strip()
 
@@ -3182,48 +3780,137 @@ class AegisApp(_BaseApp):
     def _poll_queue(self):
         try:
             while True:
-                item = self._ui_queue.get_nowait()
-                kind = item[0]
-                if kind == "delta":
-                    _, bubble, text = item
-                    bubble.update_text(text)
-                    self._scroll_to_bottom()
-                elif kind == "tool":
-                    _, name, args = item
-                    arg_str = json.dumps(args, ensure_ascii=False)[:120]
-                    self._add_bubble("system", f"Araç çalıştırıldı: {name}({arg_str})")
-                    if name.startswith("browser_") and not self._browser_bubble_shown:
-                        self._browser_bubble_shown = True
-                        self._add_browser_bubble()
-                elif kind == "note":
-                    _, note = item
-                    self._add_bubble("system", note)
-                    self._refresh_key_summary()
-                elif kind == "done":
-                    _, bubble, reply = item
-                    bubble.update_text(reply or "(boş yanıt)")
-                    self._set_busy(False)
-                    self._set_status("Hazır", COL_TEXT_DIM)
-                    self._refresh_session_list()
-                    self._scroll_to_bottom()
-                elif kind == "cancelled":
-                    _, bubble = item
-                    bubble.update_text((bubble.text_var or "") + "\n\n[kesildi]")
-                    self._set_busy(False)
-                    if self._steer_pending_text is not None:
-                        self._set_status("Yeni talimatla devam ediliyor...", COL_ACCENT)
-                        self.after(50, self._send_message)
-                    else:
-                        self._set_status("İptal edildi", COL_WARN)
-                elif kind == "error":
-                    _, bubble, msg, tb = item
-                    bubble.update_text(f"Hata: {msg}")
-                    print(tb)
-                    self._set_busy(False)
-                    self._set_status(f"Hata: {msg}", COL_ERROR)
-        except queue.Empty:
-            pass
-        self.after(60, self._poll_queue)
+                try:
+                    item = self._ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                
+                # Her bir öğeyi güvenli bir şekilde işleyelim
+                try:
+                    self._process_queue_item(item)
+                except Exception as item_err:
+                    print(f"Kuyruk öğesi işlenirken hata oluştu: {item_err}")
+                    traceback.print_exc()
+        except Exception as e:
+            print("Fatal error in _poll_queue loop:", e)
+            traceback.print_exc()
+        finally:
+            self.after(60, self._poll_queue)
+
+    def _process_queue_item(self, item):
+        kind = item[0]
+        if kind == "login_status":
+            if hasattr(self, "login_status_label"):
+                self.login_status_label.configure(text=item[1], text_color="red" if "Hata" in item[1] or "iptal" in item[1] else COL_TEXT_DIM)
+        elif kind == "login_backend":
+            self.login_backend(item[1])
+        elif kind == "delta":
+            _, bubble, text = item
+            bubble.update_text(text)
+            self._scroll_to_bottom()
+        elif kind == "tool":
+            _, name, args = item
+            arg_str = json.dumps(args, ensure_ascii=False)[:120]
+            self._add_bubble("system", f"Araç çalıştırıldı: {name}({arg_str})")
+            if name.startswith("browser_") and not self._browser_bubble_shown:
+                self._browser_bubble_shown = True
+                self._add_browser_bubble()
+        elif kind == "note":
+            _, note = item
+            self._add_bubble("system", note)
+            self._refresh_key_summary()
+        elif kind == "done":
+            _, bubble, reply = item
+            bubble.update_text(reply or "(boş yanıt)")
+            self._set_busy(False)
+            self._set_status("Hazır", COL_TEXT_DIM)
+            self._refresh_session_list()
+            self._scroll_to_bottom()
+        elif kind == "cancelled":
+            _, bubble = item
+            bubble.update_text((bubble.text_var or "") + "\n\n[kesildi]")
+            self._set_busy(False)
+            if self._steer_pending_text is not None:
+                self._set_status("Yeni talimatla devam ediliyor...", COL_ACCENT)
+                self.after(50, self._send_message)
+            else:
+                self._set_status("İptal edildi", COL_WARN)
+        elif kind == "error":
+            _, bubble, msg, tb = item
+            if bubble:
+                bubble.update_text(f"Hata: {msg}")
+            print(tb)
+            self._set_busy(False)
+            self._set_status(f"Hata: {msg}", COL_ERROR)
+        elif kind == "status":
+            _, text, color = item
+            self._set_status(text, color)
+        elif kind == "voice_user":
+            _, text = item
+            self._add_bubble("user", text)
+        elif kind == "voice_assistant_start":
+            self._current_voice_bubble = self._add_bubble("assistant", "")
+        elif kind == "voice_assistant_delta":
+            _, text = item
+            if hasattr(self, "_current_voice_bubble"):
+                self._current_voice_bubble.update_text(text)
+        elif kind == "voice_err":
+            _, err_msg = item
+            self._add_bubble("system", f"Ses hatası: {err_msg}")
+
+    def toggle_voice_mode(self):
+        self.voice_mode_active = not getattr(self, "voice_mode_active", False)
+        if self.voice_mode_active:
+            if not _voice.available():
+                self.voice_mode_active = False
+                messagebox.showerror("Hata", "SpeechRecognition veya gTTS kütüphaneleri eksik!")
+                return
+            self.voice_toggle_btn.set_kind("mic", icon_color=COL_ERROR)
+            self._cancel_event = threading.Event()
+            self._voice_thread = threading.Thread(target=self._voice_chat_loop, daemon=True)
+            self._voice_thread.start()
+        else:
+            self.voice_toggle_btn.set_kind("mic", icon_color=COL_TEXT_DIM)
+            _voice.stop_playback()
+            self._set_status("Hazır", COL_TEXT_DIM)
+
+    def _voice_chat_loop(self):
+        while getattr(self, "voice_mode_active", False):
+            self._ui_queue.put(("status", "Dinliyor...", COL_SUCCESS))
+            text, err = _voice.listen_once(timeout=8)
+            
+            if not getattr(self, "voice_mode_active", False):
+                break
+                
+            if text:
+                self._ui_queue.put(("voice_user", text))
+                self._ui_queue.put(("status", "Düşünüyor...", COL_ACCENT))
+                
+                try:
+                    self._ui_queue.put(("voice_assistant_start",))
+                    
+                    acc = {"text": ""}
+                    def on_text_delta(chunk):
+                        acc["text"] += chunk
+                        self._ui_queue.put(("voice_assistant_delta", acc["text"]))
+                        
+                    reply, interrupted = self.engine.send(
+                        text, on_text_delta=on_text_delta,
+                        cancel_event=self._cancel_event
+                    )
+                    
+                    if not getattr(self, "voice_mode_active", False) or interrupted:
+                        break
+                        
+                    self._ui_queue.put(("status", "Konuşuyor...", COL_WARN))
+                    _voice.speak(reply, active_check_fn=lambda: getattr(self, "voice_mode_active", False))
+                except Exception as ex:
+                    self._ui_queue.put(("voice_err", str(ex)))
+                    time.sleep(2)
+            else:
+                time.sleep(0.5)
+                
+        self._ui_queue.put(("status", "Hazır", COL_TEXT_DIM))
 
     # ------------------------------------------------------------------
     # Dosya/görsel ekleme
@@ -3399,7 +4086,7 @@ class AegisApp(_BaseApp):
         ).pack(fill="x", padx=20, pady=(4, 4))
 
         def reset_browser_profile():
-            if _browser.page:
+            if _browser.is_active():
                 _browser.close()
             try:
                 shutil.rmtree(BROWSER_PROFILE_DIR, ignore_errors=True)
@@ -3431,6 +4118,8 @@ class AegisApp(_BaseApp):
 
     def _on_close(self):
         try:
+            self.voice_mode_active = False
+            _voice.stop_playback()
             if self.engine.transcript:
                 self.engine.save()
             self.key_manager.stop()
