@@ -38,8 +38,6 @@ playwright install
 python aegis.py
 ```
 
-On first run, you'll be prompted to enter your Gemini API key(s), which are stored in `~/.gemini_agent/config.json`. You can add or remove keys anytime from the settings window.
-
 ## Requirements
 
 - Python 3.9+
