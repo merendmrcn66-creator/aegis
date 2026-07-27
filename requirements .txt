@@ -1,0 +1,11 @@
+google-generativeai
+customtkinter
+rich
+pillow
+opencv-python
+numpy
+SpeechRecognition
+pyttsx3
+pyaudio
+watchdog
+playwright
